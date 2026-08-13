@@ -94,6 +94,7 @@ BROWSER_TOOLS_PROMPT = """\
 - `browser_navigate(url)` - 访问网页
 - `browser_click(selector)` - 点击元素（推荐）
 - `browser_fill(selector, value)` - 填写表单
+- `browser_upload_file(selector, file_path)` - 上传文件到 file input（绕过系统对话框）
 - `browser_scroll(direction)` - 滚动页面
 - `browser_go_back()` / `browser_refresh()` - 返回/刷新
 
@@ -218,6 +219,8 @@ class HeadlessBrowserPlugin(BasePlugin):
         self.download_dir = cfg.get("download_dir") or str(data_dir / "downloads")
         self.screenshot_max_count: int = cfg.get("screenshot_max_count", 50)  # 最多保留50张截图
         self.screenshot_auto_clean: bool = bool(cfg.get("screenshot_auto_clean", True))  # 自动清理开关
+        # Cookie目录：存放各网站的cookie JSON文件，启动时自动加载
+        self.cookies_dir = cfg.get("cookies_dir", "data/files/cookie")
         
         # 浏览器实例
         self._playwright = None
@@ -329,6 +332,54 @@ class HeadlessBrowserPlugin(BasePlugin):
                 # 创建页面
                 self._page = await self._context.new_page()
                 self._page.set_default_timeout(self.timeout * 1000)
+                
+                # 自动加载 cookie 目录下所有站点的 cookie 文件
+                cookies_dir = self.cookies_dir
+                os.makedirs(cookies_dir, exist_ok=True)
+                try:
+                    import glob, json
+                    cookie_files = sorted(glob.glob(os.path.join(cookies_dir, "*.json")))
+                    for cookie_file in cookie_files:
+                        try:
+                            with open(cookie_file, "r", encoding="utf-8") as f:
+                                cookies = json.load(f)
+                            # 兼容嵌套格式：如果数据在 cookies 字段内则提取
+                            if isinstance(cookies, dict) and 'cookies' in cookies:
+                                cookies = cookies['cookies']
+                            if not isinstance(cookies, list):
+                                cookies = [cookies]
+                            # sameSite 映射
+                            ss_map = {'strict': 'Strict', 'lax': 'Lax', 'none': 'None', 'no_restriction': 'None', 'unspecified': 'Lax'}
+                            pw_cookies = []
+                            for c in cookies:
+                                if not isinstance(c, dict):
+                                    continue
+                                if not all(k in c for k in ("name", "value", "domain")):
+                                    logger.warning(
+                                        f"[HeadlessBrowser] cookie缺少必要字段，已跳过: {c}"
+                                    )
+                                    continue
+                                ss_raw = str(c.get('sameSite', 'Lax')).lower()
+                                ss = ss_map.get(ss_raw, 'Lax')
+                                cookie = {
+                                    'name': c['name'],
+                                    'value': c['value'],
+                                    'domain': c['domain'],
+                                    'path': c.get('path', '/'),
+                                    'secure': c.get('secure', False),
+                                    'httpOnly': c.get('httpOnly', False),
+                                    'sameSite': ss,
+                                }
+                                if c.get('expirationDate'):
+                                    cookie['expires'] = int(c['expirationDate'])
+                                pw_cookies.append(cookie)
+                            if pw_cookies:
+                                await self._context.add_cookies(pw_cookies)
+                                logger.info(f"[HeadlessBrowser] 已加载cookie: {os.path.basename(cookie_file)} ({len(pw_cookies)} 个)")
+                        except Exception as e:
+                            logger.warning(f"[HeadlessBrowser] 跳过cookie文件 {os.path.basename(cookie_file)}: {e}")
+                except Exception as e:
+                    logger.error(f"[HeadlessBrowser] 扫描cookie目录失败: {e}")
                 
                 logger.info("[HeadlessBrowser] 浏览器已启动")
             except ImportError:
@@ -479,6 +530,7 @@ class HeadlessBrowserPlugin(BasePlugin):
     def _is_vision_model(self, model_client) -> bool:
         """
         宽松判断模型是否可用于视觉任务。
+
         KiraAI 的 desc_img 本身不做视觉能力校验，模型是否支持视觉由实际调用决定，
         这里只排除明确不具备视觉能力的模型类型，避免硬编码关键词误杀视觉模型。
         """
@@ -493,7 +545,7 @@ class HeadlessBrowserPlugin(BasePlugin):
         """获取用于图片描述的VLM客户端（必须是LLMModelClient）"""
         from core.provider import LLMModelClient
         
-        # 优先使用插件配置的VLM模型
+        # 优先使用配置的VLM模型
         if self.vlm_model:
             try:
                 client = self.ctx.get_llm_client(model_uuid=self.vlm_model)
@@ -768,6 +820,40 @@ class HeadlessBrowserPlugin(BasePlugin):
             return f"✅ 已在 {selector} 填写文本"
         except Exception as e:
             return f"❌ 填写失败: {str(e)}"
+    
+    @register.tool(
+        name="browser_upload_file",
+        description="上传文件到指定文件输入框（input type=file），绕过系统文件对话框，直接通过Playwright CDP设置文件路径",
+        params={
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "CSS选择器，指定文件输入框（如 #upload-files、input[type=file]）"},
+                "file_path": {"type": "string", "description": "要上传的文件的绝对路径"}
+            },
+            "required": ["selector", "file_path"]
+        }
+    )
+    async def upload_file(self, event, selector: str, file_path: str) -> str:
+        """
+        上传文件到文件输入框，使用 Playwright setInputFiles 绕过系统文件对话框。
+
+        出于安全考虑，仅允许上传插件数据目录内的文件，避免本地敏感文件被外传。
+        """
+        await self._ensure_browser()
+        try:
+            # 安全限制：仅允许上传插件数据目录内的文件
+            resolved = os.path.realpath(file_path)
+            allowed_root = os.path.realpath(str(self.ctx.get_plugin_data_dir()))
+            if not resolved.startswith(allowed_root + os.sep):
+                return f"❌ 出于安全考虑，仅允许上传 {allowed_root} 下的文件"
+            if not os.path.isfile(resolved):
+                return f"❌ 文件不存在或不是常规文件: {file_path}"
+            
+            # 使用 Playwright 的 set_input_files 上传文件（绕过系统文件对话框）
+            await self._page.set_input_files(selector, resolved)
+            return f"✅ 已上传文件到 {selector}: {os.path.basename(resolved)}"
+        except Exception as e:
+            return f"❌ 上传失败: {str(e)}"
     
     @register.tool(
         name="browser_get_text",
@@ -1194,8 +1280,10 @@ class HeadlessBrowserPlugin(BasePlugin):
                 for model_info in model_infos:
                     if model_info.model_type.value == "llm":
                         model_uuid = f"{provider_id}:{model_info.model_id}"
-                        # 简单判断是否为视觉模型
-                        if any(kw in model_info.model_id.lower() for kw in ['vision', 'vl', 'gpt-4o', 'claude-3', 'kimi-k2', 'qwen-vl', 'yi-vl', 'glm-4v']):
+                        # 简单判断是否为视觉模型（与 _is_vision_model 保持一致的宽松策略）
+                        model_id_lower = model_info.model_id.lower()
+                        non_vision_markers = ['embedding', 'rerank', 'tts', 'stt', 'davinci', 'babbage', 'whisper']
+                        if not any(marker in model_id_lower for marker in non_vision_markers):
                             vision_models.append(f"  👁️ {model_uuid}")
                         else:
                             other_models.append(f"  {model_uuid}")
@@ -1247,7 +1335,7 @@ class HeadlessBrowserPlugin(BasePlugin):
         }
     )
     async def set_vlm_mode(self, event) -> str:
-        """【已弃用】临时切换VLM描述模式"""
+        """已弃用：临时切换VLM描述模式"""
         return "⚠️ 该功能已弃用。VLM 现在固定使用工具优化模式进行分析。\n如需自定义提示词，请在插件配置中设置 vlm_describe_prompt。"
     
     @register.tool(
